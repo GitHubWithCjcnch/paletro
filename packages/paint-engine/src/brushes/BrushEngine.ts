@@ -1,19 +1,37 @@
-import { Application, Container, Graphics, RenderTexture, Sprite, Texture } from "pixi.js";
+import {
+  Application,
+  Container,
+  Graphics,
+  RenderTexture,
+  Sprite,
+  Texture,
+} from "pixi.js";
 
-/** Adaptive smoothing (faster motion = more smoothing). */
-function smoothStep(prev: {x:number;y:number}, cur:{x:number;y:number}, dt:number){
-  const dx = cur.x - prev.x, dy = cur.y - prev.y;
-  const v = Math.hypot(dx, dy) / Math.max(dt, 1e-3); // px/sec
-  // Map velocity to alpha (0..1). Higher v → lower alpha → more smoothing.
-  const k = 80; // tune feel
-  const alpha = Math.min(0.9, Math.max(0.15, k / (k + v)));
+function smoothStep(
+  prev: { x: number; y: number },
+  cur: { x: number; y: number },
+  dt: number,
+  k = 80,
+  minAlpha = 0.15,
+  maxAlpha = 0.9,
+): { x: number; y: number } {
+  // If dt is tiny or smoothing is disabled, skip smoothing.
+  if (dt <= 0) return { x: cur.x, y: cur.y };
+  const dx = cur.x - prev.x;
+  const dy = cur.y - prev.y;
+  const v = Math.hypot(dx, dy) / dt;
+  const alpha = Math.min(maxAlpha, Math.max(minAlpha, k / (k + v)));
   return { x: prev.x + alpha * dx, y: prev.y + alpha * dy };
 }
 
 type BrushOptions = {
-  size: number;          // pixels (diameter)
-  color: number;         // 0xRRGGBB
-  hardness?: number;     // 0..1 (not used in MVP—placeholder for soft brushes)
+  size: number;
+  color: number;
+  hardness?: number;
+  useSmoothing?: boolean;
+  smoothingK?: number;
+  minAlpha?: number;
+  maxAlpha?: number;
 };
 
 export class BrushEngine {
@@ -22,14 +40,22 @@ export class BrushEngine {
   private layerSprite: Sprite;
   private stage: Container;
   private brushTex: Texture;
-  private stamp: Sprite;         // re-used sprite for each “stamp”
-  private cursor: Graphics;      // tiny circle cursor
+  private stamp: Sprite;
+  private cursor: Graphics;
   private drawing = false;
-  private lastPt: {x:number;y:number}|null = null;
+  private lastPt: { x: number; y: number } | null = null;
   private lastTime = 0;
   private domEl: HTMLElement;
   private _size: number;
   private _color: number;
+  private useSmoothing: boolean;
+  private k: number;
+  private minAlpha: number;
+  private maxAlpha: number;
+
+  private onRawUpdate = (ev: Event) => {
+    this.onMove(ev as unknown as PointerEvent);
+  };
 
   constructor(app: Application, containerEl: HTMLElement, opts: BrushOptions) {
     this.app = app;
@@ -38,50 +64,59 @@ export class BrushEngine {
 
     this._size = opts.size;
     this._color = opts.color;
+    this.useSmoothing = opts.useSmoothing ?? true;
+    this.k = opts.smoothingK ?? 80;
+    this.minAlpha = opts.minAlpha ?? 0.15;
+    this.maxAlpha = opts.maxAlpha ?? 0.9;
 
-    // 1) Persistent layer we paint into (fast)
-    this.layerRT = RenderTexture.create({ width: app.screen.width, height: app.screen.height, resolution: app.renderer.resolution });
+    this.layerRT = RenderTexture.create({
+      width: app.screen.width,
+      height: app.screen.height,
+      resolution: app.renderer.resolution,
+    });
     this.layerSprite = new Sprite(this.layerRT);
     this.stage.addChild(this.layerSprite);
 
-    // 2) Brush texture (hard round for MVP)
-    const g = new Graphics()
-      .circle(0, 0, 64)        // base radius = 64 -> size scale later
-      .fill(this._color);
+    // Create a master brush texture (white circle).
+    const g = new Graphics().circle(0, 0, 64).fill(0xffffff);
     this.brushTex = app.renderer.generateTexture(g);
     this.stamp = new Sprite(this.brushTex);
     this.stamp.anchor.set(0.5);
+    this.stamp.tint = this._color;
 
-    // 3) Cursor (tiny circle that follows pointer)
+    // Cursor graphics.
     this.cursor = new Graphics();
     this.stage.addChild(this.cursor);
-    this.updateCursor(0, 0);
+    this.updateCursorShape();
+    this.updateCursorPos(0, 0);
 
-    // 4) Events
-    this.domEl.addEventListener("pointerdown", this.onDown, { passive: true });
-    this.domEl.addEventListener("pointerup", this.onUp, { passive: true });
-    this.domEl.addEventListener("pointerleave", this.onUp, { passive: true });
-    this.domEl.addEventListener("pointermove", this.onMove, { passive: true });
+    // Attach pointer listeners.
+    const listenerOpts = { passive: true } as const;
+    this.domEl.addEventListener("pointerdown", this.onDown, listenerOpts);
+    this.domEl.addEventListener("pointerup", this.onUp, listenerOpts);
+    this.domEl.addEventListener("pointerleave", this.onUp, listenerOpts);
+    this.domEl.addEventListener("pointermove", this.onMove, listenerOpts);
+    this.domEl.addEventListener("pointerrawupdate", this.onRawUpdate as EventListener, listenerOpts);
 
-    // Resize handling – keep previous content (simple: recreate target)
     const onResize = () => this.resizeLayer();
     app.renderer.on("resize", onResize);
     (this.app as any).__onResize = onResize;
   }
 
-  /** Public API */
   setSize = (px: number) => {
     this._size = Math.max(1, Math.min(400, px));
-    this.updateCursor(undefined, undefined); // redraw outline with new size
+    this.updateCursorShape();
   };
 
+  /** Change the brush tint colour. */
   setColor = (hex: number) => {
     this._color = hex;
-    // recolor brush quick & dirty (regen texture)
-    const g = new Graphics().circle(0, 0, 64).fill(this._color);
-    this.brushTex.destroy(true);
-    this.brushTex = this.app.renderer.generateTexture(g);
-    this.stamp.texture = this.brushTex;
+    this.stamp.tint = hex;
+  };
+
+  /** Enable or disable smoothing dynamically. */
+  setSmoothing = (enabled: boolean) => {
+    this.useSmoothing = enabled;
   };
 
   destroy = () => {
@@ -89,6 +124,7 @@ export class BrushEngine {
     this.domEl.removeEventListener("pointerup", this.onUp);
     this.domEl.removeEventListener("pointerleave", this.onUp);
     this.domEl.removeEventListener("pointermove", this.onMove);
+    this.domEl.removeEventListener("pointerrawupdate", this.onRawUpdate as EventListener);
     (this.app.renderer as any).off?.("resize", (this.app as any).__onResize);
     this.cursor.destroy(true);
     this.layerSprite.destroy(true);
@@ -97,34 +133,35 @@ export class BrushEngine {
     this.stamp.destroy(true);
   };
 
-  /** Internals */
-  private updateCursor(x?: number, y?: number) {
+  /** Draw the cursor graphic when the size changes. */
+  private updateCursorShape() {
     const cur = this.cursor;
     cur.clear();
-    cur.circle(x ?? cur.x, y ?? cur.y, Math.max(2, this._size * 0.5))
+    cur.circle(0, 0, Math.max(2, this._size * 0.5))
       .stroke({ width: 1, color: 0x4e3a36, alpha: 0.9 })
-      .fill({ color: 0xffffff, alpha: 0.0001 }); // ensure it gets pointer events
-    if (x !== undefined && y !== undefined) {
-      cur.position.set(x, y);
-    }
+      .fill({ color: 0xffffff, alpha: 0.0001 });
+  }
+
+  /** Only update the cursor’s position. */
+  private updateCursorPos(x: number, y: number) {
+    this.cursor.position.set(x, y);
   }
 
   private mapClientToWorld = (clientX: number, clientY: number) => {
     const out = { x: 0, y: 0 };
-    // @ts-ignore - pixi events has mapPositionToPoint
     this.app.renderer.events.mapPositionToPoint(out, clientX, clientY);
     return out;
   };
 
   private onDown = (e: PointerEvent) => {
     this.drawing = true;
-    this.lastPt = null;
     this.lastTime = performance.now();
-    // draw a first stamp (with pressure)
     const p = this.mapClientToWorld(e.clientX, e.clientY);
-    this.updateCursor(p.x, p.y);
-    const pressure = e.pressure && e.pressure > 0 ? e.pressure : 0.8;
+    this.updateCursorPos(p.x, p.y);
+
+    const pressure = e.pressure && e.pressure > 0 ? e.pressure : 1;
     this.stampAt(p.x, p.y, pressure);
+    this.lastPt = p;
   };
 
   private onUp = () => {
@@ -133,37 +170,44 @@ export class BrushEngine {
   };
 
   private onMove = (e: PointerEvent) => {
-    // Always move cursor
     const pNow = this.mapClientToWorld(e.clientX, e.clientY);
-    this.updateCursor(pNow.x, pNow.y);
+    this.updateCursorPos(pNow.x, pNow.y);
+    if (!this.drawing || !this.lastPt) return;
 
-    if (!this.drawing) return;
-
-    // Use coalesced events when available for buttery motion
-    const list = (e as any).getCoalescedEvents?.() ?? [e];
-    for (const ce of list) {
+    // Process coalesced events for high precision.
+    const events = (e as any).getCoalescedEvents?.() ?? [e];
+    for (const ce of events) {
       const p = this.mapClientToWorld(ce.clientX, ce.clientY);
       const now = performance.now();
-
-      if (!this.lastPt) {
-        this.lastPt = p;
-        this.lastTime = now;
-        continue;
-      }
-
       const dt = (now - this.lastTime) / 1000;
-      const smoothed = smoothStep(this.lastPt, p, dt);
-      this.stampLine(this.lastPt, smoothed, ce.pressure ?? e.pressure ?? 0.7);
 
-      this.lastPt = smoothed;
+      let target = p;
+      if (this.useSmoothing) {
+        target = smoothStep(
+          this.lastPt,
+          p,
+          dt,
+          this.k,
+          this.minAlpha,
+          this.maxAlpha,
+        );
+      }
+      this.stampLine(this.lastPt, target, ce.pressure ?? e.pressure ?? 1);
+      this.lastPt = target;
       this.lastTime = now;
     }
   };
 
-  private stampLine(a: {x:number;y:number}, b:{x:number;y:number}, pressure:number) {
-    const spacing = Math.max(0.25 * this._size, 1); // px between stamps
-    const dx = b.x - a.x, dy = b.y - a.y;
+  private stampLine(
+    a: { x: number; y: number },
+    b: { x: number; y: number },
+    pressure: number,
+  ) {
+    const dx = b.x - a.x;
+    const dy = b.y - a.y;
     const dist = Math.hypot(dx, dy);
+    const spacing = Math.max(0.25 * this._size, 1);
+
     if (dist < 0.01) {
       this.stampAt(b.x, b.y, pressure);
       return;
@@ -177,20 +221,28 @@ export class BrushEngine {
     }
   }
 
-  private stampAt(x:number, y:number, pressure:number) {
-    // pressure 0..1 → scale 0.3..1.0 (MVP feel)
-    const s = (0.3 + 0.7 * (isFinite(pressure) ? pressure : 0.7)) * (this._size / 128); // 128 = brushTex diameter
+  private stampAt(x: number, y: number, pressure: number) {
+    // Scale the sprite based on pressure and brush size.
+    const p = isFinite(pressure) ? pressure : 1;
+    const s = (0.3 + 0.7 * p) * (this._size / 128);
     this.stamp.scale.set(s);
     this.stamp.position.set(x, y);
-    // Draw into the RenderTexture (persistent)
-    this.app.renderer.render({ container: this.stamp, target: this.layerRT });
+
+    this.app.renderer.render({
+      container: this.stamp,
+      target: this.layerRT,
+      clear: false,
+    });
   }
 
   private resizeLayer() {
     const { width, height } = this.app.screen;
-    // For MVP: simply recreate RT. (Later: copy old into new with scaling.)
     this.layerRT.destroy(true);
-    this.layerRT = RenderTexture.create({ width, height, resolution: this.app.renderer.resolution });
+    this.layerRT = RenderTexture.create({
+      width,
+      height,
+      resolution: this.app.renderer.resolution,
+    });
     this.layerSprite.texture = this.layerRT;
   }
 }

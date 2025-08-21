@@ -3,6 +3,10 @@ type BrushOptions = {
     size: number;
     color: number;
     hardness?: number;
+    useSmoothing?: boolean;
+    smoothingK?: number;
+    minAlpha?: number;
+    maxAlpha?: number;
 };
 export declare class BrushEngine {
     private app;
@@ -18,13 +22,22 @@ export declare class BrushEngine {
     private domEl;
     private _size;
     private _color;
+    private useSmoothing;
+    private k;
+    private minAlpha;
+    private maxAlpha;
+    private onRawUpdate;
     constructor(app: Application, containerEl: HTMLElement, opts: BrushOptions);
-    /** Public API */
     setSize: (px: number) => void;
+    /** Change the brush tint colour. */
     setColor: (hex: number) => void;
+    /** Enable or disable smoothing dynamically. */
+    setSmoothing: (enabled: boolean) => void;
     destroy: () => void;
-    /** Internals */
-    private updateCursor;
+    /** Draw the cursor graphic when the size changes. */
+    private updateCursorShape;
+    /** Only update the cursor’s position. */
+    private updateCursorPos;
     private mapClientToWorld;
     private onDown;
     private onUp;
