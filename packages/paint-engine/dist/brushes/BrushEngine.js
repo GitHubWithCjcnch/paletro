@@ -1,22 +1,25 @@
-import { Graphics, RenderTexture, Sprite, } from "pixi.js";
+import { Container, Graphics, RenderTexture, Sprite, } from "pixi.js";
 function smoothStep(prev, cur, dt, k = 80, minAlpha = 0.15, maxAlpha = 0.9) {
-    // If dt is tiny or smoothing is disabled, skip smoothing.
-    if (dt <= 0)
+    if (dt <= 0) {
         return { x: cur.x, y: cur.y };
+    }
     const dx = cur.x - prev.x;
     const dy = cur.y - prev.y;
     const v = Math.hypot(dx, dy) / dt;
     const alpha = Math.min(maxAlpha, Math.max(minAlpha, k / (k + v)));
-    return { x: prev.x + alpha * dx, y: prev.y + alpha * dy };
+    return {
+        x: prev.x + alpha * dx,
+        y: prev.y + alpha * dy,
+    };
 }
 export class BrushEngine {
     app;
+    stage;
     layerRT;
     layerSprite;
-    stage;
-    brushTex;
-    stamp;
+    strokeContainer;
     cursor;
+    brushTex;
     drawing = false;
     lastPt = null;
     lastTime = 0;
@@ -47,18 +50,14 @@ export class BrushEngine {
         });
         this.layerSprite = new Sprite(this.layerRT);
         this.stage.addChild(this.layerSprite);
-        // Create a master brush texture (white circle).
+        this.strokeContainer = new Container();
+        this.stage.addChild(this.strokeContainer);
         const g = new Graphics().circle(0, 0, 64).fill(0xffffff);
         this.brushTex = app.renderer.generateTexture(g);
-        this.stamp = new Sprite(this.brushTex);
-        this.stamp.anchor.set(0.5);
-        this.stamp.tint = this._color;
-        // Cursor graphics.
         this.cursor = new Graphics();
         this.stage.addChild(this.cursor);
         this.updateCursorShape();
         this.updateCursorPos(0, 0);
-        // Attach pointer listeners.
         const listenerOpts = { passive: true };
         this.domEl.addEventListener("pointerdown", this.onDown, listenerOpts);
         this.domEl.addEventListener("pointerup", this.onUp, listenerOpts);
@@ -73,12 +72,9 @@ export class BrushEngine {
         this._size = Math.max(1, Math.min(400, px));
         this.updateCursorShape();
     };
-    /** Change the brush tint colour. */
     setColor = (hex) => {
         this._color = hex;
-        this.stamp.tint = hex;
     };
-    /** Enable or disable smoothing dynamically. */
     setSmoothing = (enabled) => {
         this.useSmoothing = enabled;
     };
@@ -89,13 +85,13 @@ export class BrushEngine {
         this.domEl.removeEventListener("pointermove", this.onMove);
         this.domEl.removeEventListener("pointerrawupdate", this.onRawUpdate);
         this.app.renderer.off?.("resize", this.app.__onResize);
+        this.commitStroke();
         this.cursor.destroy(true);
         this.layerSprite.destroy(true);
         this.layerRT.destroy(true);
         this.brushTex.destroy(true);
-        this.stamp.destroy(true);
+        this.strokeContainer.destroy(true);
     };
-    /** Draw the cursor graphic when the size changes. */
     updateCursorShape() {
         const cur = this.cursor;
         cur.clear();
@@ -103,7 +99,6 @@ export class BrushEngine {
             .stroke({ width: 1, color: 0x4e3a36, alpha: 0.9 })
             .fill({ color: 0xffffff, alpha: 0.0001 });
     }
-    /** Only update the cursor’s position. */
     updateCursorPos(x, y) {
         this.cursor.position.set(x, y);
     }
@@ -113,6 +108,7 @@ export class BrushEngine {
         return out;
     };
     onDown = (e) => {
+        this.commitStroke();
         this.drawing = true;
         this.lastTime = performance.now();
         const p = this.mapClientToWorld(e.clientX, e.clientY);
@@ -124,13 +120,13 @@ export class BrushEngine {
     onUp = () => {
         this.drawing = false;
         this.lastPt = null;
+        this.commitStroke();
     };
     onMove = (e) => {
         const pNow = this.mapClientToWorld(e.clientX, e.clientY);
         this.updateCursorPos(pNow.x, pNow.y);
         if (!this.drawing || !this.lastPt)
             return;
-        // Process coalesced events for high precision.
         const events = e.getCoalescedEvents?.() ?? [e];
         for (const ce of events) {
             const p = this.mapClientToWorld(ce.clientX, ce.clientY);
@@ -163,16 +159,24 @@ export class BrushEngine {
         }
     }
     stampAt(x, y, pressure) {
-        // Scale the sprite based on pressure and brush size.
         const p = isFinite(pressure) ? pressure : 1;
         const s = (0.3 + 0.7 * p) * (this._size / 128);
-        this.stamp.scale.set(s);
-        this.stamp.position.set(x, y);
-        this.app.renderer.render({
-            container: this.stamp,
-            target: this.layerRT,
-            clear: false,
-        });
+        const sprite = new Sprite(this.brushTex);
+        sprite.anchor.set(0.5);
+        sprite.tint = this._color;
+        sprite.scale.set(s);
+        sprite.position.set(x, y);
+        this.strokeContainer.addChild(sprite);
+    }
+    commitStroke() {
+        if (this.strokeContainer.children.length > 0) {
+            this.app.renderer.render({
+                container: this.strokeContainer,
+                target: this.layerRT,
+                clear: false,
+            });
+            this.strokeContainer.removeChildren();
+        }
     }
     resizeLayer() {
         const { width, height } = this.app.screen;

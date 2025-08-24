@@ -10,12 +10,12 @@ type BrushOptions = {
 };
 export declare class BrushEngine {
     private app;
+    private stage;
     private layerRT;
     private layerSprite;
-    private stage;
-    private brushTex;
-    private stamp;
+    private strokeContainer;
     private cursor;
+    private brushTex;
     private drawing;
     private lastPt;
     private lastTime;
@@ -29,14 +29,10 @@ export declare class BrushEngine {
     private onRawUpdate;
     constructor(app: Application, containerEl: HTMLElement, opts: BrushOptions);
     setSize: (px: number) => void;
-    /** Change the brush tint colour. */
     setColor: (hex: number) => void;
-    /** Enable or disable smoothing dynamically. */
     setSmoothing: (enabled: boolean) => void;
     destroy: () => void;
-    /** Draw the cursor graphic when the size changes. */
     private updateCursorShape;
-    /** Only update the cursor’s position. */
     private updateCursorPos;
     private mapClientToWorld;
     private onDown;
@@ -44,6 +40,7 @@ export declare class BrushEngine {
     private onMove;
     private stampLine;
     private stampAt;
+    private commitStroke;
     private resizeLayer;
 }
 export {};

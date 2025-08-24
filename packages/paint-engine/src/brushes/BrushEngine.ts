@@ -15,13 +15,17 @@ function smoothStep(
   minAlpha = 0.15,
   maxAlpha = 0.9,
 ): { x: number; y: number } {
-  // If dt is tiny or smoothing is disabled, skip smoothing.
-  if (dt <= 0) return { x: cur.x, y: cur.y };
+  if (dt <= 0) {
+    return { x: cur.x, y: cur.y };
+  }
   const dx = cur.x - prev.x;
   const dy = cur.y - prev.y;
   const v = Math.hypot(dx, dy) / dt;
   const alpha = Math.min(maxAlpha, Math.max(minAlpha, k / (k + v)));
-  return { x: prev.x + alpha * dx, y: prev.y + alpha * dy };
+  return {
+    x: prev.x + alpha * dx,
+    y: prev.y + alpha * dy,
+  };
 }
 
 type BrushOptions = {
@@ -36,12 +40,12 @@ type BrushOptions = {
 
 export class BrushEngine {
   private app: Application;
+  private stage: Container;
   private layerRT: RenderTexture;
   private layerSprite: Sprite;
-  private stage: Container;
-  private brushTex: Texture;
-  private stamp: Sprite;
+  private strokeContainer: Container;
   private cursor: Graphics;
+  private brushTex: Texture;
   private drawing = false;
   private lastPt: { x: number; y: number } | null = null;
   private lastTime = 0;
@@ -77,26 +81,27 @@ export class BrushEngine {
     this.layerSprite = new Sprite(this.layerRT);
     this.stage.addChild(this.layerSprite);
 
-    // Create a master brush texture (white circle).
+    this.strokeContainer = new Container();
+    this.stage.addChild(this.strokeContainer);
+
     const g = new Graphics().circle(0, 0, 64).fill(0xffffff);
     this.brushTex = app.renderer.generateTexture(g);
-    this.stamp = new Sprite(this.brushTex);
-    this.stamp.anchor.set(0.5);
-    this.stamp.tint = this._color;
 
-    // Cursor graphics.
     this.cursor = new Graphics();
     this.stage.addChild(this.cursor);
     this.updateCursorShape();
     this.updateCursorPos(0, 0);
 
-    // Attach pointer listeners.
     const listenerOpts = { passive: true } as const;
     this.domEl.addEventListener("pointerdown", this.onDown, listenerOpts);
     this.domEl.addEventListener("pointerup", this.onUp, listenerOpts);
     this.domEl.addEventListener("pointerleave", this.onUp, listenerOpts);
     this.domEl.addEventListener("pointermove", this.onMove, listenerOpts);
-    this.domEl.addEventListener("pointerrawupdate", this.onRawUpdate as EventListener, listenerOpts);
+    this.domEl.addEventListener(
+      "pointerrawupdate",
+      this.onRawUpdate as EventListener,
+      listenerOpts,
+    );
 
     const onResize = () => this.resizeLayer();
     app.renderer.on("resize", onResize);
@@ -108,13 +113,10 @@ export class BrushEngine {
     this.updateCursorShape();
   };
 
-  /** Change the brush tint colour. */
   setColor = (hex: number) => {
     this._color = hex;
-    this.stamp.tint = hex;
   };
 
-  /** Enable or disable smoothing dynamically. */
   setSmoothing = (enabled: boolean) => {
     this.useSmoothing = enabled;
   };
@@ -124,16 +126,19 @@ export class BrushEngine {
     this.domEl.removeEventListener("pointerup", this.onUp);
     this.domEl.removeEventListener("pointerleave", this.onUp);
     this.domEl.removeEventListener("pointermove", this.onMove);
-    this.domEl.removeEventListener("pointerrawupdate", this.onRawUpdate as EventListener);
+    this.domEl.removeEventListener(
+      "pointerrawupdate",
+      this.onRawUpdate as EventListener,
+    );
     (this.app.renderer as any).off?.("resize", (this.app as any).__onResize);
+    this.commitStroke();
     this.cursor.destroy(true);
     this.layerSprite.destroy(true);
     this.layerRT.destroy(true);
     this.brushTex.destroy(true);
-    this.stamp.destroy(true);
+    this.strokeContainer.destroy(true);
   };
 
-  /** Draw the cursor graphic when the size changes. */
   private updateCursorShape() {
     const cur = this.cursor;
     cur.clear();
@@ -142,7 +147,6 @@ export class BrushEngine {
       .fill({ color: 0xffffff, alpha: 0.0001 });
   }
 
-  /** Only update the cursor’s position. */
   private updateCursorPos(x: number, y: number) {
     this.cursor.position.set(x, y);
   }
@@ -154,11 +158,11 @@ export class BrushEngine {
   };
 
   private onDown = (e: PointerEvent) => {
+    this.commitStroke();
     this.drawing = true;
     this.lastTime = performance.now();
     const p = this.mapClientToWorld(e.clientX, e.clientY);
     this.updateCursorPos(p.x, p.y);
-
     const pressure = e.pressure && e.pressure > 0 ? e.pressure : 1;
     this.stampAt(p.x, p.y, pressure);
     this.lastPt = p;
@@ -167,6 +171,7 @@ export class BrushEngine {
   private onUp = () => {
     this.drawing = false;
     this.lastPt = null;
+    this.commitStroke();
   };
 
   private onMove = (e: PointerEvent) => {
@@ -174,7 +179,6 @@ export class BrushEngine {
     this.updateCursorPos(pNow.x, pNow.y);
     if (!this.drawing || !this.lastPt) return;
 
-    // Process coalesced events for high precision.
     const events = (e as any).getCoalescedEvents?.() ?? [e];
     for (const ce of events) {
       const p = this.mapClientToWorld(ce.clientX, ce.clientY);
@@ -192,7 +196,11 @@ export class BrushEngine {
           this.maxAlpha,
         );
       }
-      this.stampLine(this.lastPt, target, ce.pressure ?? e.pressure ?? 1);
+      this.stampLine(
+        this.lastPt,
+        target,
+        ce.pressure ?? e.pressure ?? 1,
+      );
       this.lastPt = target;
       this.lastTime = now;
     }
@@ -222,17 +230,25 @@ export class BrushEngine {
   }
 
   private stampAt(x: number, y: number, pressure: number) {
-    // Scale the sprite based on pressure and brush size.
     const p = isFinite(pressure) ? pressure : 1;
     const s = (0.3 + 0.7 * p) * (this._size / 128);
-    this.stamp.scale.set(s);
-    this.stamp.position.set(x, y);
+    const sprite = new Sprite(this.brushTex);
+    sprite.anchor.set(0.5);
+    sprite.tint = this._color;
+    sprite.scale.set(s);
+    sprite.position.set(x, y);
+    this.strokeContainer.addChild(sprite);
+  }
 
-    this.app.renderer.render({
-      container: this.stamp,
-      target: this.layerRT,
-      clear: false,
-    });
+  private commitStroke() {
+    if (this.strokeContainer.children.length > 0) {
+      this.app.renderer.render({
+        container: this.strokeContainer,
+        target: this.layerRT,
+        clear: false,
+      });
+      this.strokeContainer.removeChildren();
+    }
   }
 
   private resizeLayer() {
